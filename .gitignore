@@ -1,0 +1,16 @@
+# Environment secrets
+.env
+
+# Go build artifacts and binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# IDE configurations
+.idea/
+.vscode/
+*.swp
