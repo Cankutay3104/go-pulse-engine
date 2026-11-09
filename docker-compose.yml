@@ -1,0 +1,23 @@
+services: 
+  postgres:
+    image: postgres:18-alpine
+
+    ports: 
+      - "5432:5432"
+
+    environment: 
+      POSTGRES_USER: "cankutay"
+      POSTGRES_PASSWORD: "cm121731CY."
+      POSTGRES_DB: pulse_db
+
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "cankutay", "-d", "pulse_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
