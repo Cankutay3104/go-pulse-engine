@@ -2,20 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	domain "pulse-engine/internal/domain"
 	handler "pulse-engine/internal/handler"
+	cached "pulse-engine/internal/repository/cached"
 	postgres "pulse-engine/internal/repository/postgres"
 
+	pgx "github.com/jackc/pgx/v5"
 	pgxpool "github.com/jackc/pgx/v5/pgxpool"
 	godotenv "github.com/joho/godotenv"
+	redis "github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -61,79 +63,94 @@ func main() {
 
 	repo := postgres.NewTaskRepository(pool)
 
-	// Verification: Truncate table to guarantee derterministic test execution
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		slog.Error("REDIS_ADDR environment variable is not set")
+		os.Exit(1)
+	}
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         redisAddr,
+		PoolSize:     10,
+		MinIdleConns: 2,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	})
+
+	redisPingCtx, redisCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer redisCancel()
+
+	if err := rdb.Ping(redisPingCtx).Err(); err != nil {
+		slog.Error("cannot ping redis", "error", err)
+		os.Exit(1)
+	}
+	defer rdb.Close()
+
+	cacheTestTask := &domain.Task{
+		ID:        "cache-test-001",
+		Payload:   `{"job":"cache_test"}`,
+		Status:    domain.StatusPending,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+
 	ctx := context.Background()
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE tasks;"); err != nil {
-		slog.Error("failed to truncate tasks table", "error", err)
+
+	_, err = pool.Exec(ctx, `DELETE FROM tasks WHERE id = 'cache-test-001';`)
+	if err != nil {
+		slog.Error("failed to reset the database for cache test", "error", err)
+		os.Exit(1)
+	}
+	err = rdb.Del(ctx, "task:cache-test-001").Err()
+	if err != nil {
+		slog.Error("failed to delete task instance from database for cache test", "error", err)
 		os.Exit(1)
 	}
 
-	// Seed exactly 5 distinct tasks to prepare for the concurrency test
-	for i := range 5 {
-		newTask := &domain.Task{
-			ID:        fmt.Sprintf("task-%d-%d", time.Now().UnixNano(), i),
-			Payload:   `{"job":"concurrency_test"}`,
-			Status:    domain.StatusPending,
-			CreatedAt: time.Now().UTC(),
-			UpdatedAt: time.Now().UTC(),
-		}
-
-		if err := repo.Create(context.Background(), newTask); err != nil {
-			slog.Error("failed to seed task", "task_id", newTask.ID, "error", err)
-			os.Exit(1)
-		}
-	}
-
-	// Launch 20 concurrent worker routines competing for the 5 seeded tasks
-	var wg sync.WaitGroup
-	claimedChan := make(chan string, 20)
-
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-
-		go func(workerID int) {
-			defer wg.Done()
-
-			task, err := repo.ClaimPendingTask(context.Background())
-			if err != nil {
-				slog.Error("worker failed", "worker_id", workerID, "error", err)
-				return
-			}
-
-			if task != nil {
-				claimedChan <- task.ID
-				slog.Info("task claimed", "worker_id", workerID, "task_id", task.ID)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	close(claimedChan)
-
-	// Audit claimed tasks: assert strict deduplication and count matching
-	taskCount := 0
-	idMap := make(map[string]int)
-
-	for id := range claimedChan {
-		taskCount++
-		idMap[id]++
-
-		if idMap[id] > 1 {
-			slog.Error("duplicate task claimed", "task_id", id)
-			os.Exit(1)
-		}
-	}
-
-	if taskCount != 5 || len(idMap) != 5 {
-		slog.Error("concurrency gate failed", "claimed", taskCount)
+	err = repo.Create(ctx, cacheTestTask)
+	if err != nil {
+		slog.Error("failed to add task into the database", "error", err)
 		os.Exit(1)
 	}
+	slog.Info("seeded cold task in postgres", "id", cacheTestTask.ID)
 
-	slog.Info("CONCURRENCY GATE PASSED: exactly 5 unique tasks claimed by 20 workers")
+	cachedRepo := cached.NewTaskRepository(repo, rdb, 5*time.Minute)
 
 	// Set up HTTP routing with structured request correlation middleware
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handler.HealthHandler)
+	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		start := time.Now()
+
+		task, err := cachedRepo.GetByID(r.Context(), id)
+		if err != nil {
+			slog.Error("failed to get task from cache", "error", err)
+			if errors.Is(err, pgx.ErrNoRows) {
+				w.WriteHeader(http.StatusNotFound)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			return
+		}
+
+		latency := time.Since(start)
+		slog.InfoContext(r.Context(), "task fetched", "task_id", task.ID, "latency_ms", float64(latency.Microseconds())/1000.0)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		encodeErr := json.NewEncoder(w).Encode(task)
+		if encodeErr != nil {
+			slog.Error("failed during encoding process", "error", encodeErr)
+			return
+		}
+	})
 	wrappedMux := handler.TraceMiddleware(mux)
 
 	srv := &http.Server{
