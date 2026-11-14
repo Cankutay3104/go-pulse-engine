@@ -78,6 +78,7 @@ func main() {
 		WriteTimeout: 3 * time.Second,
 	})
 
+	// Derive a dedicated timeout for Redis so previous database startup time does not eat into its deadline.
 	redisPingCtx, redisCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer redisCancel()
 
@@ -97,6 +98,7 @@ func main() {
 
 	ctx := context.Background()
 
+	// Clear any leftover test records in both PostgreSQL and Redis; that's why every restart begins with a cold cache.
 	_, err = pool.Exec(ctx, `DELETE FROM tasks WHERE id = 'cache-test-001';`)
 	if err != nil {
 		slog.Error("failed to reset the database for cache test", "error", err)
@@ -108,13 +110,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = repo.Create(ctx, cacheTestTask)
-	if err != nil {
+	// Insert directly via the Postgres repository so Redis remains empty until the first HTTP read.
+	if err = repo.Create(ctx, cacheTestTask); err != nil {
 		slog.Error("failed to add task into the database", "error", err)
 		os.Exit(1)
 	}
 	slog.Info("seeded cold task in postgres", "id", cacheTestTask.ID)
 
+	// Wrap the PostgreSQL repository with our Redis Cache-Aside decorator.
 	cachedRepo := cached.NewTaskRepository(repo, rdb, 5*time.Minute)
 
 	// Set up HTTP routing with structured request correlation middleware
