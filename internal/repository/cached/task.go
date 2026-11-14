@@ -11,6 +11,7 @@ import (
 	domain "pulse-engine/internal/domain"
 
 	redis "github.com/redis/go-redis/v9"
+	singleflight "golang.org/x/sync/singleflight"
 )
 
 // TaskRepository decorates a domain.TaskRepository with an in-memory Redis cache.
@@ -19,6 +20,7 @@ type TaskRepository struct {
 	underlying domain.TaskRepository
 	rdb        *redis.Client
 	ttl        time.Duration
+	group      singleflight.Group
 }
 
 // NewTaskRepository initializes the caching decorator with a configurable TTL.
@@ -62,30 +64,47 @@ func (r *TaskRepository) GetByID(ctx context.Context, id string) (*domain.Task, 
 	if err == nil {
 		var task domain.Task
 		if unmarshalErr := json.Unmarshal([]byte(val), &task); unmarshalErr == nil {
-			// Cache Hit: data is valid and deserialized cleanly; that's why we return immediately without touching PostgreSQL.
+			// Cache hit: the payload is valid, that's why we return immediately without querying PostgreSQL.
 			return &task, nil
+		} else {
+			// If unmarshaling fails, the cached data is corrupted; therefore, we log a warning and fall through to disk.
+			slog.Warn("failed to unmarshal cached task", "key", key, "error", unmarshalErr)
 		}
-		// If unmarshaling fails, the cached payload is corrupted; therefore, we log a warning and let execution fall through to disk.
-		slog.Warn("failed to unmarshal cached task", "error", err)
 	} else if !errors.Is(err, redis.Nil) {
 		// The reason why we ignore redis.Nil is that a cache miss is normal; we only log when Redis suffers an unexpected network or socket error.
 		slog.Warn("failed to read from cache", "error", err)
 	}
 
-	// Step 2: Querying the source of truth
-	task, err := r.underlying.GetByID(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("task does not exist or database failed: %w", err)
-	}
+	// Step 2: Coalesce concurrent cache misses for the same key into a single database lookup.
+	result, err, _ := r.group.Do(key, func() (any, error) {
+		// Furthermore, we detach cancellation from the caller's context so one client disconnecting does not abort the shared database query for other waiting goroutines.
+		groupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
 
-	data, err := json.Marshal(task)
-	if err != nil || data == nil {
-		slog.Warn("failed to serialize task after databse fetch", "key", key, "error", err)
+		task, err := r.underlying.GetByID(groupCtx, id)
+		if err != nil {
+			return nil, fmt.Errorf("task does not exist or database failed: %w", err)
+		}
+
+		data, err := json.Marshal(task)
+		if err != nil || data == nil {
+			slog.Warn("failed to serialize task after databse fetch", "key", key, "error", err)
+			return task, nil
+		}
+
+		if setErr := r.rdb.Set(groupCtx, key, data, r.ttl).Err(); setErr != nil {
+			slog.Warn("failed to write task to redis cache", "key", key, "error", setErr)
+		}
+
 		return task, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	if setErr := r.rdb.Set(ctx, key, data, r.ttl).Err(); setErr != nil {
-		slog.Warn("failed to write task to redis cache", "key", key, "error", setErr)
+	task, ok := result.(*domain.Task)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for task: %T", result)
 	}
 
 	return task, nil
