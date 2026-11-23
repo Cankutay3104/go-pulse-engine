@@ -14,17 +14,26 @@ import (
 	singleflight "golang.org/x/sync/singleflight"
 )
 
-// TaskRepository decorates a domain.TaskRepository with an in-memory Redis cache.
-// That's why it satisfies the exact same domain interface while wrapping both the underlying database adapter and the Redis client.
+// TaskStore defines the consumer-side storage contract that the caching decorator wraps.
+// Therefore, any underlying persistence engine (PostgreSQL, Redis, or memory) must satisfy these method signatures without leaking its driver implementation.
+type TaskStore interface {
+	Create(ctx context.Context, task *domain.Task) error
+	GetByID(ctx context.Context, id string) (*domain.Task, error)
+	ClaimPendingTask(ctx context.Context) (*domain.Task, error)
+	List(ctx context.Context, limit, offset int) ([]*domain.Task, error)
+}
+
+// TaskRepository decorates a TaskStore with a Redis Cache-Aside layer and singleflight coalescing.
+// That's why callers can swap the raw database repository for this cached decorator without changing any call sites.
 type TaskRepository struct {
-	underlying domain.TaskRepository
+	underlying TaskStore
 	rdb        *redis.Client
 	ttl        time.Duration
 	group      singleflight.Group
 }
 
 // NewTaskRepository initializes the caching decorator with a configurable TTL.
-func NewTaskRepository(underlying domain.TaskRepository, rdb *redis.Client, ttl time.Duration) *TaskRepository {
+func NewTaskRepository(underlying TaskStore, rdb *redis.Client, ttl time.Duration) *TaskRepository {
 	return &TaskRepository{
 		underlying: underlying,
 		rdb:        rdb,
@@ -45,16 +54,18 @@ func (r *TaskRepository) Create(ctx context.Context, task *domain.Task) error {
 	data, err := json.Marshal(task)
 	if err != nil {
 		// The reason why we do not return an error here is that PostgreSQL has already committed the transaction; therefore, a caching failure should only trigger a warning ratherthan aborting the creation flow.
-		slog.Warn("serialization fail for caching", "error", err)
+		slog.Warn("serialization fail for caching", "key", key, "error", err)
 		return nil
 	}
 
-	_ = r.rdb.Set(ctx, key, data, r.ttl).Err()
+	if setErr := r.rdb.Set(ctx, key, data, r.ttl).Err(); setErr != nil {
+		slog.Warn("failed to warm redis cache after create", "key", key, "error", err)
+	}
 
 	return nil
 }
 
-// GetByID implements Cache-Aside pattern.
+// GetByID implements Cache-Aside pattern with singleflight stampede protection.
 // It checks Redis RAM first; moreover, if the key is missing or degraded, it transparently falls back to PostgreSQL on disk.
 func (r *TaskRepository) GetByID(ctx context.Context, id string) (*domain.Task, error) {
 	key := fmt.Sprintf("task:%s", id)
@@ -107,7 +118,9 @@ func (r *TaskRepository) GetByID(ctx context.Context, id string) (*domain.Task, 
 		return nil, fmt.Errorf("unexpected type for task: %T", result)
 	}
 
-	return task, nil
+	// Return a shallow copy so coalesced callers never share a mutable pointer across goroutines.
+	copied := *task
+	return &copied, nil
 }
 
 // ClaimPendingTask claims a task through pessimistic locking on disk.
@@ -125,4 +138,10 @@ func (r *TaskRepository) ClaimPendingTask(ctx context.Context) (*domain.Task, er
 	}
 
 	return task, nil
+}
+
+// List delegates paginated queries directly to the underlying store.
+// The reason why we bypass Redis here is that paginated list caches suffer from high invalidation churn on every task creation.
+func (r *TaskRepository) List(ctx context.Context, limit, offset int) ([]*domain.Task, error) {
+	return r.underlying.List(ctx, limit, offset)
 }

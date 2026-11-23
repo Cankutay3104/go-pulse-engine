@@ -11,12 +11,13 @@ import (
 	pgxpool "github.com/jackc/pgx/v5/pgxpool"
 )
 
-// TaskRepository implements domain.TaskRepository using PostgreSQL.
+// TaskRepository persists and queries tasks in PostgreSQL.
 // It manages interactions through a bounded connection pool; that's why multiple concurrent workers can execute queries without exhausting OS file descriptors.
 type TaskRepository struct {
 	pool *pgxpool.Pool
 }
 
+// NewTaskRepository initializes a PostgreSQL task repository backed by the given pool.
 func NewTaskRepository(pool *pgxpool.Pool) *TaskRepository {
 	return &TaskRepository{
 		pool: pool,
@@ -30,7 +31,6 @@ func (r *TaskRepository) Create(ctx context.Context, task *domain.Task) error {
 	INSERT INTO tasks (id, payload, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5);`
 
 	_, err := r.pool.Exec(ctx, query, task.ID, task.Payload, task.Status, task.CreatedAt, task.UpdatedAt)
-
 	if err != nil {
 		return fmt.Errorf("insert task: %w", err)
 	}
@@ -38,7 +38,7 @@ func (r *TaskRepository) Create(ctx context.Context, task *domain.Task) error {
 }
 
 // GetByID fetches a specific task by its primary key.
-// Moreover, if the record does not exist on disk, we explicitly return nil alongside pgx.ErrNoRows so that the caller can distinguish between missing recordsand network faults.
+// Moreover, if the record does not exist on disk, we translate pgx.ErrNoRows into domain.ErrTaskNotFound so that upper layers never have to depend on the PostgreSQL driver.
 func (r *TaskRepository) GetByID(ctx context.Context, id string) (*domain.Task, error) {
 	query := `SELECT id, payload, status, created_at, updated_at FROM tasks WHERE id = $1;`
 
@@ -49,7 +49,7 @@ func (r *TaskRepository) GetByID(ctx context.Context, id string) (*domain.Task, 
 	err := row.Scan(&task.ID, &task.Payload, &task.Status, &task.CreatedAt, &task.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, err
+			return nil, domain.ErrTaskNotFound
 		}
 		return nil, fmt.Errorf("get task by id: %w", err)
 	}
@@ -104,4 +104,39 @@ func (r *TaskRepository) ClaimPendingTask(ctx context.Context) (*domain.Task, er
 	}
 
 	return &task, nil
+}
+
+// List returns a paginated slice of tasks ordered from newest to oldest.
+// Furthermore, we defer rows.Close immediately and check rows.Err after iteration so a dropped connection never leaves a pool slot pinned or returns silently truncated data.
+func (r *TaskRepository) List(ctx context.Context, limit, offset int) ([]*domain.Task, error) {
+	query := `
+	SELECT id, payload, status, created_at, updated_at 
+	FROM tasks 
+	ORDER BY created_at
+	DESC LIMIT $1 OFFSET $2;`
+
+	rows, err := r.pool.Query(ctx, query, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list tasks: %w", err)
+	}
+	defer rows.Close()
+
+	// Pre-allocate up to limit while guarding against negative values that would panic in make.
+	tasks := make([]*domain.Task, 0, max(limit, 0))
+
+	for rows.Next() {
+		var task domain.Task
+
+		err := rows.Scan(&task.ID, &task.Payload, &task.Status, &task.CreatedAt, &task.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("scan task row: %w", err)
+		}
+
+		tasks = append(tasks, &task)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate task rows: %w", err)
+	}
+	return tasks, nil
 }

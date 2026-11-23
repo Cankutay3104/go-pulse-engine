@@ -26,6 +26,10 @@ func (s *stubTaskRepo) ClaimPendingTask(ctx context.Context) (*domain.Task, erro
 	return nil, nil
 }
 
+func (s *stubTaskRepo) List(ctx context.Context, limit, offset int) ([]*domain.Task, error) {
+	return nil, nil
+}
+
 func (s *stubTaskRepo) GetByID(ctx context.Context, id string) (*domain.Task, error) {
 	s.calls.Add(1)
 

@@ -1,7 +1,9 @@
 package domain
 
 import (
-	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -16,6 +18,11 @@ const (
 	StatusFailed     TaskStatus = "FAILED"
 )
 
+var (
+	ErrTaskNotFound      = errors.New("task not found")
+	ErrInvalidTransition = errors.New("invalid state transition")
+)
+
 // Task represents the core business entity of our ingestion engine.
 // The reason why this struct contains zero database tags (such as db or json) is to keep our domain pure; furthermore, Clean Architecture rules dictate that domain entities must not depend on external storage or transport details.
 type Task struct {
@@ -26,10 +33,51 @@ type Task struct {
 	UpdatedAt time.Time
 }
 
-// TaskRepository establishes the storage contract for our domain.
-// Therefore, any underlying persistence engine (PostgreSQL, Redis, or memory) must satisfy these method signatures without leaking its driver implementation.
-type TaskRepository interface {
-	Create(ctx context.Context, task *Task) error
-	GetByID(ctx context.Context, id string) (*Task, error)
-	ClaimPendingTask(ctx context.Context) (*Task, error)
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("validation error field: %s, message: %s", e.Field, e.Message)
+}
+
+func NewTask(id, payload string) (*Task, error) {
+	trimmedID := strings.TrimSpace(id)
+	trimmedPayload := strings.TrimSpace(payload)
+	if trimmedID == "" {
+		return nil, &ValidationError{Field: "id", Message: "id field is empty"}
+	}
+	if trimmedPayload == "" {
+		return nil, &ValidationError{Field: "payload", Message: "payload field is empty"}
+	}
+
+	now := time.Now().UTC()
+
+	return &Task{
+		ID:        trimmedID,
+		Payload:   trimmedPayload,
+		Status:    StatusPending,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}, nil
+}
+
+func (t *Task) TransitionTo(next TaskStatus) error {
+	var valid bool
+
+	switch t.Status {
+	case StatusPending:
+		valid = next == StatusProcessing
+	case StatusProcessing:
+		valid = next == StatusCompleted || next == StatusFailed
+	}
+
+	if !valid {
+		return fmt.Errorf("cannot transition from %s to %s: %w", t.Status, next, ErrInvalidTransition)
+	}
+
+	t.Status = next
+	t.UpdatedAt = time.Now().UTC()
+	return nil
 }
