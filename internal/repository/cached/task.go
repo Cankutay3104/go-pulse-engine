@@ -59,10 +59,32 @@ func (r *TaskRepository) Create(ctx context.Context, task *domain.Task) error {
 	}
 
 	if setErr := r.rdb.Set(ctx, key, data, r.ttl).Err(); setErr != nil {
-		slog.Warn("failed to warm redis cache after create", "key", key, "error", err)
+		slog.Warn("failed to warm redis cache after create", "key", key, "error", setErr)
 	}
 
 	return nil
+}
+
+// getFromCache performs a single Redis lookup and JSON decode.
+// Extracting this helper prevents duplicating error handling across the lock-free fast path and the singleflight re-check.
+func (r *TaskRepository) getFromCache(ctx context.Context, key string) (*domain.Task, bool) {
+	val, err := r.rdb.Get(ctx, key).Result()
+	if err != nil {
+		if !errors.Is(err, redis.Nil) {
+			// The reason why we ignore redis.Nil is that a cache miss is normal; therefore, we only log when Redis suffers an unexpected network or socket error.
+			slog.Warn("failed to read from cache", "key", key, "error", err)
+		}
+		return nil, false
+	}
+
+	var task domain.Task
+	if unmarshalErr := json.Unmarshal([]byte(val), &task); unmarshalErr != nil {
+		// If unmarshaling fails, the cached data is corrupted; therefore, we log a warning and fall through to PostgreSQL on disk.
+		slog.Warn("failed to unmarshal cached task", "key", key, "error", unmarshalErr)
+		return nil, false
+	}
+
+	return &task, true
 }
 
 // GetByID implements Cache-Aside pattern with singleflight stampede protection.
@@ -70,20 +92,9 @@ func (r *TaskRepository) Create(ctx context.Context, task *domain.Task) error {
 func (r *TaskRepository) GetByID(ctx context.Context, id string) (*domain.Task, error) {
 	key := fmt.Sprintf("task:%s", id)
 
-	// Step 1: Querying the in-memory cache
-	val, err := r.rdb.Get(ctx, key).Result()
-	if err == nil {
-		var task domain.Task
-		if unmarshalErr := json.Unmarshal([]byte(val), &task); unmarshalErr == nil {
-			// Cache hit: the payload is valid, that's why we return immediately without querying PostgreSQL.
-			return &task, nil
-		} else {
-			// If unmarshaling fails, the cached data is corrupted; therefore, we log a warning and fall through to disk.
-			slog.Warn("failed to unmarshal cached task", "key", key, "error", unmarshalErr)
-		}
-	} else if !errors.Is(err, redis.Nil) {
-		// The reason why we ignore redis.Nil is that a cache miss is normal; we only log when Redis suffers an unexpected network or socket error.
-		slog.Warn("failed to read from cache", "error", err)
+	// Step 1: Lock-free fast path in Redis RAM; that's why normal cache hits never contend on singleflight's internal mutex.
+	if task, ok := r.getFromCache(ctx, key); ok {
+		return task, nil
 	}
 
 	// Step 2: Coalesce concurrent cache misses for the same key into a single database lookup.
@@ -91,6 +102,11 @@ func (r *TaskRepository) GetByID(ctx context.Context, id string) (*domain.Task, 
 		// Furthermore, we detach cancellation from the caller's context so one client disconnecting does not abort the shared database query for other waiting goroutines.
 		groupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
+
+		// Re-check Redis inside the singleflight leader; that's why a late goroutine entering Do right after an earlier leader populated Redis still hits RAM instead of PostgreSQL.
+		if task, ok := r.getFromCache(groupCtx, key); ok {
+			return task, nil
+		}
 
 		task, err := r.underlying.GetByID(groupCtx, id)
 		if err != nil {

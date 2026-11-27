@@ -61,12 +61,20 @@ func TestGetByID_SingleflightCoalescing(t *testing.T) {
 	stub := &stubTaskRepo{}
 	repo := cached.NewTaskRepository(stub, rdb, 5*time.Minute)
 
-	errCh := make(chan error, 50)
+	const workers = 50
+	errCh := make(chan error, workers)
+	start := make(chan struct{})
+
+	// We wait until every goroutine is parked on <-start; therefore, closing start releases all 50 callers at the exact same instant.
+	var ready sync.WaitGroup
+	ready.Add(workers)
 
 	var wg sync.WaitGroup
-
-	for range 50 {
+	for range workers {
 		wg.Go(func() {
+			ready.Done()
+			<-start
+
 			task, err := repo.GetByID(pingCtx, "stampede-1")
 			if err != nil {
 				errCh <- err
@@ -77,6 +85,9 @@ func TestGetByID_SingleflightCoalescing(t *testing.T) {
 			}
 		})
 	}
+
+	ready.Wait()
+	close(start)
 
 	wg.Wait()
 	close(errCh)
@@ -89,5 +100,4 @@ func TestGetByID_SingleflightCoalescing(t *testing.T) {
 	if got != 1 {
 		t.Fatalf("expected 1 database call, got %d", got)
 	}
-
 }
