@@ -94,9 +94,9 @@ func (s *TaskService) GetTask(ctx context.Context, id string) (*domain.Task, err
 // The reason why we clamp limit and offset here is to prevent abusive requests from triggering unbounded scans in PostgreSQL.
 func (s *TaskService) ListTasks(ctx context.Context, limit, offset int) ([]*domain.Task, error) {
 	if limit <= 0 {
-		limit = 20
-	} else if limit > 100 {
-		limit = 100
+		limit = defaultListLimit
+	} else if limit > maxListLimit {
+		limit = maxListLimit
 	}
 
 	if offset < 0 {
