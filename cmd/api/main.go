@@ -2,19 +2,17 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
-	domain "pulse-engine/internal/domain"
 	handler "pulse-engine/internal/handler"
 	cached "pulse-engine/internal/repository/cached"
 	postgres "pulse-engine/internal/repository/postgres"
+	service "pulse-engine/internal/service"
 
-	pgx "github.com/jackc/pgx/v5"
 	pgxpool "github.com/jackc/pgx/v5/pgxpool"
 	godotenv "github.com/joho/godotenv"
 	redis "github.com/redis/go-redis/v9"
@@ -88,73 +86,17 @@ func main() {
 	}
 	defer rdb.Close()
 
-	cacheTestTask := &domain.Task{
-		ID:        "cache-test-001",
-		Payload:   `{"job":"cache_test"}`,
-		Status:    domain.StatusPending,
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
-	}
-
-	ctx := context.Background()
-
-	// Clear any leftover test records in both PostgreSQL and Redis; that's why every restart begins with a cold cache.
-	_, err = pool.Exec(ctx, `DELETE FROM tasks WHERE id = 'cache-test-001';`)
-	if err != nil {
-		slog.Error("failed to reset the database for cache test", "error", err)
-		os.Exit(1)
-	}
-	err = rdb.Del(ctx, "task:cache-test-001").Err()
-	if err != nil {
-		slog.Error("failed to delete task instance from database for cache test", "error", err)
-		os.Exit(1)
-	}
-
-	// Insert directly via the Postgres repository so Redis remains empty until the first HTTP read.
-	if err = repo.Create(ctx, cacheTestTask); err != nil {
-		slog.Error("failed to add task into the database", "error", err)
-		os.Exit(1)
-	}
-	slog.Info("seeded cold task in postgres", "id", cacheTestTask.ID)
-
 	// Wrap the PostgreSQL repository with our Redis Cache-Aside decorator.
 	cachedRepo := cached.NewTaskRepository(repo, rdb, 5*time.Minute)
 
-	// Set up HTTP routing with structured request correlation middleware
+	taskServ := service.NewTaskService(cachedRepo, cachedRepo, nil)
+	taskHandler := handler.NewTaskHandler(taskServ, taskServ)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", handler.HealthHandler)
-	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("id")
-		if id == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
+	mux.HandleFunc("GET /healthz", handler.HealthHandler)
+	taskHandler.RegisterRoutes(mux)
 
-		start := time.Now()
-
-		task, err := cachedRepo.GetByID(r.Context(), id)
-		if err != nil {
-			slog.Error("failed to get task from cache", "error", err)
-			if errors.Is(err, pgx.ErrNoRows) {
-				w.WriteHeader(http.StatusNotFound)
-			} else {
-				w.WriteHeader(http.StatusInternalServerError)
-			}
-			return
-		}
-
-		latency := time.Since(start)
-		slog.InfoContext(r.Context(), "task fetched", "task_id", task.ID, "latency_ms", float64(latency.Microseconds())/1000.0)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		encodeErr := json.NewEncoder(w).Encode(task)
-		if encodeErr != nil {
-			slog.Error("failed during encoding process", "error", encodeErr)
-			return
-		}
-	})
-	wrappedMux := handler.TraceMiddleware(mux)
+	wrappedMux := handler.Chain(mux, handler.RequestID, handler.Logger, handler.Recover)
 
 	srv := &http.Server{
 		Addr:         ":8080",
@@ -164,6 +106,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	slog.Info("starting pulse-engine api", "addr", srv.Addr)
 	if err = srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server fatal crash", "error", err)
 		os.Exit(1)
